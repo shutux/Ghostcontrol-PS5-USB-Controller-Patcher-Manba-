@@ -19,7 +19,8 @@ export PATH="/c/"
   -D__PROSPERO__ -Wall -Wextra -g -O2 -fPIC -fno-stack-protector \
   -o ghost-control-manba-v2-nbjr.elf \
   gc_main.c shellui_pad.c usb_helpers.c \
-  controller_nintendo.c controller_xbox.c controller_ds4.c controller_mamba.c \
+  controller_nintendo.c controller_xbox.c controller_ds4.c controller_ds5.c controller_mamba.c \
+  game_output.c bridge/wireless_ds4.c \
   -lScePad -lSceUserService -lpthread -ldl \
   --start-no-unused-arguments \
   -lSceLibcInternal -lSceNet \

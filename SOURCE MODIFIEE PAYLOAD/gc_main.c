@@ -5,6 +5,8 @@
  * Patch Manba V2 NBJr:
  *   - PC/XInput mode                (VID=045E PID=028E)
  *   - Switch USB mode               (VID=057E PID=2009)
+ *   - DS5Dongle Ghost USB           (VID=CAFE PID=0D55)
+ *   - DS5Dongle legacy Sony IDs     (VID=054C PID=0CE6/0DF2, no USB serial)
  *
  * Each detected controller gets its own VDA device + force_bind
  * assignment dialog + VDI injection thread.
@@ -45,7 +47,43 @@
 #include "controller_nintendo.h"
 #include "controller_xbox.h"
 #include "controller_ds4.h"
+#include "controller_ds5.h"
 #include "controller_mamba.h"
+#include "game_output.h"
+
+static int locked_shellui_force_bind(uint64_t device_id, int32_t user_id)
+{
+    game_output_kernel_lock();
+    int result = shellui_pad_force_bind(device_id, user_id);
+    game_output_kernel_unlock();
+    return result;
+}
+
+static int locked_shellui_disconnect(uint64_t device_id)
+{
+    game_output_kernel_lock();
+    int result = shellui_pad_disconnect_device(device_id);
+    game_output_kernel_unlock();
+    return result;
+}
+
+static int locked_shellui_disconnect_candidate(uint64_t excluded,
+                                                uint64_t *disconnected)
+{
+    game_output_kernel_lock();
+    int result = shellui_pad_disconnect_first_physical_candidate(
+        excluded, disconnected);
+    game_output_kernel_unlock();
+    return result;
+}
+
+static int locked_shellui_user_has_handle(int32_t user_id, int32_t handle)
+{
+    game_output_kernel_lock();
+    int result = shellui_pad_user_has_handle(user_id, handle);
+    game_output_kernel_unlock();
+    return result;
+}
 
 /* ── Logging ──────────────────────────────────────────────────────────── */
 #define LOG_DIR  "/data/ghostpad"
@@ -534,7 +572,7 @@ static void physical_recovery_tick(int scan) {
 
     gp_log("physical recover attempt #%d dev=0x%llx user=0x%08x\n",
            attempt, (unsigned long long)dev, (uint32_t)g_inject_uid);
-    int br = shellui_pad_force_bind(dev, g_inject_uid);
+    int br = locked_shellui_force_bind(dev, g_inject_uid);
     gp_log("physical recover force_bind dev=0x%llx ret=%d\n",
            (unsigned long long)dev, br);
 
@@ -586,7 +624,7 @@ static void maybe_disconnect_physical_pad_for_slot(int slot) {
             fallback_attempted[slot] = 1;
             gp_log("slot[%d] no physical Open Pad before Manba dev=0x%llx; sweeping MBus physical ids\n",
                    slot, (unsigned long long)vdev);
-            int sr = shellui_pad_disconnect_first_physical_candidate(vdev, &swept);
+            int sr = locked_shellui_disconnect_candidate(vdev, &swept);
             gp_log("slot[%d] physical sweep ret=%d dev=0x%llx\n",
                    slot, sr, (unsigned long long)swept);
             if (sr == 0 && swept) {
@@ -614,7 +652,7 @@ static void maybe_disconnect_physical_pad_for_slot(int slot) {
 
     gp_log("slot[%d] game opened physical pad dev=0x%llx before Manba dev=0x%llx; disconnecting physical\n",
            slot, (unsigned long long)phys, (unsigned long long)vdev);
-    int dr = shellui_pad_disconnect_device(phys);
+    int dr = locked_shellui_disconnect(phys);
     gp_log("slot[%d] disconnect physical dev=0x%llx ret=%d\n",
            slot, (unsigned long long)phys, dr);
     if (dr == 0)
@@ -696,7 +734,7 @@ static void release_mamba_vda_only(int slot, const char *reason) {
            slot, (uint32_t)handle, (unsigned long long)vdev,
            reason ? reason : "-");
     if (vdev) {
-        int vdr = shellui_pad_disconnect_device(vdev);
+        int vdr = locked_shellui_disconnect(vdev);
         gp_log("slot[%d] release pause disconnect virtual dev=0x%llx ret=%d\n",
                slot, (unsigned long long)vdev, vdr);
     }
@@ -743,7 +781,7 @@ static void maybe_stop_mamba_for_same_user_physical_open(uint64_t dev_id,
         return;
 
     int local_match = local_pad_user_has_handle(g_inject_uid, open_handle);
-    int match = local_match ? 3 : shellui_pad_user_has_handle(g_inject_uid, open_handle);
+    int match = local_match ? 3 : locked_shellui_user_has_handle(g_inject_uid, open_handle);
     gp_log("reclaim_check: physical dev=0x%llx handle=0x%x user=0x%08x match=%d local=%d slot[%d] vdev=0x%llx evicted=0x%llx line=%.220s\n",
            (unsigned long long)dev_id, (uint32_t)open_handle,
            (uint32_t)g_inject_uid, match, local_match, slot,
@@ -807,6 +845,23 @@ static int probe_one_path(const char *path, uint16_t *out_vid, uint16_t *out_pid
             uint16_t pid = UGETW(desc.idProduct);
             desc_ok = 1;
             gp_log("scan: %s VID=0x%04x PID=0x%04x\n", path, vid, pid);
+            /* Ghost mode uses neutral CAFE:0D55 and is always ours. Legacy
+             * DS5Dongle mode uses Sony 054C:0CE6/0DF2 without a USB serial.
+             * A retail DualSense has a serial, so leave it to the system. */
+            if (ds5_is_usb_vidpid(vid, pid)) {
+                gp_log("scan: %s DS5Dongle candidate iSerial=%u iMfr=%u iProd=%u\n",
+                       path, desc.iSerialNumber, desc.iManufacturer, desc.iProduct);
+                if (vid == VID_SONY && desc.iSerialNumber != 0) {
+                    gp_log("scan: %s serialized DualSense left to the system\n", path);
+                    close(fd);
+                    return 0;
+                }
+                gp_log("scan: %s DS5Dongle accepted\n", path);
+                *out_vid = vid;
+                *out_pid = pid;
+                close(fd);
+                return 1;
+            }
             if (vid == MAMBA_DONGLE_VID && pid == MAMBA_DONGLE_PID) {
                 gp_log("scan: %s Manba receiver idle/update mode ignored\n", path);
                 close(fd);
@@ -928,7 +983,7 @@ static int32_t create_vda_for_slot(int slot) {
     if (dev_id) {
         g_slots[slot].virtual_dev_id = dev_id;
         remember_virtual_device_id(dev_id);
-        int br = shellui_pad_force_bind(dev_id, g_inject_uid);
+        int br = locked_shellui_force_bind(dev_id, g_inject_uid);
         gp_log("slot[%d] force_bind(0x%llx, 0x%08x) ret=%d\n",
                slot, (unsigned long long)dev_id, (uint32_t)g_inject_uid, br);
 
@@ -992,44 +1047,74 @@ static void *usb_hid_thread(void *arg) {
     void    *buffers[1]; uint32_t lengths[1];
     int fd = -1, out_opened = 0;
     int usb_ready_notified = 0;
+    uint32_t ds5_output_cursor = 0;
 
     gp_log("slot[%d] USB thread: %s VID=0x%04x PID=0x%04x\n",
            slot, dev_path, vid, pid);
 
-    /* ── DS4 / HORIPAD / XIM4: single-pass, no handshake ──────────────── */
-    if (vid == VID_SONY || vid == VID_HORI) {
-        fd = open(dev_path, O_RDWR);
-        if (fd < 0) { gp_log("slot[%d] DS4 open fail errno=%d\n", slot, errno); goto exit_slot; }
+    /* ── DS4 / HORIPAD / XIM4 / DS5Dongle: no handshake ──────────────── */
+    if (ds5_is_usb_vidpid(vid, pid) || vid == VID_SONY || vid == VID_HORI) {
+        int is_ds5_open = ds5_is_usb_vidpid(vid, pid);
+        int attempts = is_ds5_open ? 5 : 1;
+        int opened = 0;
+        const char *kind = is_ds5_open ? "DS5" : "DS4";
 
-        { int ii; for(ii=0;ii<4;ii++){int i2=ii; ioctl(fd,USB_IFACE_DRIVER_DETACH,&i2);} }
-        usleep(100000);
+        /* Legacy Sony mode races the native pad driver. Ghost mode should be
+         * left alone, but retries also tolerate the generic HID driver. */
+        for (int attempt = 0; attempt < attempts && !opened; attempt++) {
+            if (fd >= 0) { close(fd); fd = -1; }
+            fd = open(dev_path, O_RDWR);
+            if (fd < 0) {
+                gp_log("slot[%d] %s open fail errno=%d\n", slot, kind, errno);
+                goto exit_slot;
+            }
 
-        memset(eps,0,sizeof(eps)); memset(&init,0,sizeof(init));
-        init.pEndpoints=eps; init.ep_index_max=2;
-        if (ioctl(fd,USB_FS_INIT,&init)!=0){
-            gp_log("slot[%d] DS4 FS_INIT fail errno=%d\n",slot,errno);
-            close(fd); goto exit_slot;
-        }
+            { int ii; for(ii=0;ii<4;ii++){int i2=ii; ioctl(fd,USB_IFACE_DRIVER_DETACH,&i2);} }
+            usleep(is_ds5_open ? 150000 : 100000);
 
-        /* Try DS4 IN ep 0x84 first (real Sony DS4); fall back to 0x81 (HORI). */
-        memset(&fs_open,0,sizeof(fs_open));
-        fs_open.ep_index=0; fs_open.ep_no=DS4_EP_IN;
-        fs_open.max_bufsize=64; fs_open.max_frames=1;
-        int in_ok = (ioctl(fd,USB_FS_OPEN,&fs_open)==0);
-        if (!in_ok) {
+            memset(eps,0,sizeof(eps)); memset(&init,0,sizeof(init));
+            init.pEndpoints=eps; init.ep_index_max=2;
+            if (ioctl(fd,USB_FS_INIT,&init)!=0){
+                gp_log("slot[%d] %s FS_INIT fail errno=%d attempt=%d\n",
+                       slot, kind, errno, attempt);
+                close(fd); fd = -1;
+                if (!is_ds5_open) goto exit_slot;
+                usleep(50000);
+                continue;
+            }
+
+            /* DS5Dongle and a real DualSense both use IN 0x84.
+             * DS4 tries 0x84 first, then 0x81 for HORI. */
             memset(&fs_open,0,sizeof(fs_open));
-            fs_open.ep_index=0; fs_open.ep_no=DS4_EP_IN_ALT;
+            fs_open.ep_index=0; fs_open.ep_no=DS4_EP_IN;
             fs_open.max_bufsize=64; fs_open.max_frames=1;
-            in_ok = (ioctl(fd,USB_FS_OPEN,&fs_open)==0);
-            if (in_ok) gp_log("slot[%d] DS4 IN ep=0x81 (HORI/clone)\n", slot);
-        } else {
-            gp_log("slot[%d] DS4 IN ep=0x84 (Sony)\n", slot);
+            int in_ok = (ioctl(fd,USB_FS_OPEN,&fs_open)==0);
+            if (!in_ok && !is_ds5_open) {
+                memset(&fs_open,0,sizeof(fs_open));
+                fs_open.ep_index=0; fs_open.ep_no=DS4_EP_IN_ALT;
+                fs_open.max_bufsize=64; fs_open.max_frames=1;
+                in_ok = (ioctl(fd,USB_FS_OPEN,&fs_open)==0);
+                if (in_ok) gp_log("slot[%d] DS4 IN ep=0x81 (HORI/clone)\n", slot);
+            } else if (in_ok) {
+                gp_log("slot[%d] %s IN ep=0x84\n", slot, kind);
+            }
+            if (!in_ok) {
+                gp_log("slot[%d] %s IN fail errno=%d attempt=%d\n",
+                       slot, kind, errno, attempt);
+                memset(&uninit,0,sizeof(uninit));
+                ioctl(fd,USB_FS_UNINIT,&uninit);
+                close(fd); fd = -1;
+                if (!is_ds5_open) goto exit_slot;
+                usleep(50000);
+                continue;
+            }
+            opened = 1;
         }
-        if (!in_ok) {
-            gp_log("slot[%d] DS4 IN fail errno=%d\n",slot,errno);
-            goto uninit_exit;
+        if (!opened) {
+            gp_log("slot[%d] %s IN give up\n", slot, kind);
+            goto exit_slot;
         }
-        gp_log("slot[%d] DS4 IN maxpkt=%u\n", slot, (unsigned)fs_open.max_packet_length);
+        gp_log("slot[%d] %s IN maxpkt=%u\n", slot, kind, (unsigned)fs_open.max_packet_length);
 
         buffers[0]=buf; lengths[0]=64;
         eps[0].ppBuffer=buffers; eps[0].pLength=lengths; eps[0].nFrames=1;
@@ -1046,7 +1131,8 @@ static void *usb_hid_thread(void *arg) {
             fs_open.max_bufsize=64; fs_open.max_frames=1;
             out_opened = (ioctl(fd,USB_FS_OPEN,&fs_open)==0) ? 1 : 0;
         }
-        gp_log("slot[%d] DS4 OUT opened=%d\n", slot, out_opened);
+        gp_log("slot[%d] %s OUT opened=%d\n", slot,
+               ds5_is_usb_vidpid(vid, pid) ? "DS5" : "DS4", out_opened);
         goto main_loop;
     }
 
@@ -1204,7 +1290,8 @@ static void *usb_hid_thread(void *arg) {
     }
 
 main_loop: ;
-    int is_ds4 = (vid == VID_SONY || vid == VID_HORI);
+    int is_ds5 = ds5_is_usb_vidpid(vid, pid);
+    int is_ds4 = ((vid == VID_SONY || vid == VID_HORI) && !is_ds5);
     int is_mamba_xinput = mamba_is_xinput_vidpid(vid, pid);
     int is_mamba_switch = mamba_is_switch_vidpid(vid, pid);
     int hs_state = (pid==PID_XBOX || is_ds4 || is_mamba_xinput) ? HS_STREAMING : HS_WAIT_81_01;
@@ -1255,7 +1342,9 @@ main_loop: ;
         ScePadData pad; memset(&pad,0,sizeof(pad)); pad.quat.w=1.0f;
         int injected = 0;
 
-        if (is_ds4) {
+        if (is_ds5) {
+            injected = ds5_handle_packet(fd, eps, buf, len, &pad);
+        } else if (is_ds4) {
             injected = ds4_handle_packet(fd, eps, buf, len, &pad);
         } else if (is_mamba_xinput) {
             injected = mamba_xinput_handle_packet(fd, eps, buf, len, &pad);
@@ -1266,6 +1355,15 @@ main_loop: ;
             injected = nintendo_handle_packet(fd, eps, buf, len, &hs_state, &nintendo_seq, &pad);
             if (injected > 0 && is_mamba_switch)
                 pad.leftStick.y = (uint8_t)(255u - pad.leftStick.y);
+        }
+
+        /* Keep all FreeBSD USB transfers on this owning thread. The game-hook
+         * thread only publishes a report to this lock-protected mailbox. */
+        if (is_ds5 && out_opened) {
+            uint8_t output_report[48];
+            if (game_output_take(&ds5_output_cursor, output_report))
+                (void)usb_send_out(fd, &eps[1], output_report,
+                                   sizeof(output_report), "DS5 game output");
         }
 
         if (g_slots[slot].released_pause) {
@@ -1347,7 +1445,7 @@ exit_slot:
     uint64_t evicted_phys = g_slots[slot].evicted_physical_dev;
     uint64_t vdev = g_slots[slot].virtual_dev_id;
     if (vdev) {
-        int vdr = shellui_pad_disconnect_device(vdev);
+        int vdr = locked_shellui_disconnect(vdev);
         gp_log("slot[%d] disconnect virtual dev=0x%llx ret=%d\n",
                slot, (unsigned long long)vdev, vdr);
     }
@@ -1441,6 +1539,7 @@ static void *controller_manager_thread(void *arg) {
             }
 
             const char *name =
+                ds5_is_usb_vidpid(vid, pid) ? "DS5Dongle" :
                 mamba_is_supported_vidpid(vid,pid) ? mamba_name(vid,pid) :
                                                      "Unknown";
 
@@ -1666,6 +1765,9 @@ int main(void) {
         pthread_detach(mgr_tid);
         gp_log("Manager thread started\n");
     }
+
+    ret = game_output_start();
+    gp_log("game output hook thread: %s (%d)\n", ret == 0 ? "started" : "failed", ret);
 
     /* Keep-alive */
     uint32_t tick = 0;

@@ -41,10 +41,42 @@ Launch-GhostControl-ManbaV2-NBJr.ps1
 
 ```
 
+## DS5Dongle（Pico）接到这台 PS5
+
+PS5 认物理 DualSense 时会做加密认证。普通 DS5Dongle 的 Sony VID/PID
+会先被系统原生手柄驱动抢走，然后因为认证失败而消失。配套固件默认开启
+`ps5_ghost_mode=1`，改用中性 USB 身份 `CAFE:0D55`，让原生驱动不再抢设备。
+
+这份 payload 不冒充 USB 手柄。它从 `/dev/ugen` 读 DS5Dongle 的报告（report `0x01`），按 DualSense 的字节布局翻译，再用 `scePadVirtualDeviceInsertData` 注入一个虚拟 DualSense。认证被绕开。
+
+用法：
+
+1. 手柄先和 Pico 配对。dongle 在蓝牙连上之前会把 USB 藏起来，PS5 这时看不到设备。
+2. 确认 `ps5_ghost_mode=1`（配套固件默认开启）。本地工具可用
+   `python tools/config_tool.py set ps5_ghost_mode=1` 设置；切换后重新插拔 Pico。
+3. Pico 插到 PS5，按一下 PS 键让手柄连上 dongle。等通知里出现 `DS5Dongle`，再按任意键分配用户。
+4. 用原来的启动脚本注入 `ELF/GhostControl-ManbaV2-NBJr-USB-Patch.elf`；
+   该 ELF 已包含 DS5Dongle 映射。
+
+已经映射：摇杆、十字键、面部键、肩键、L2/R2 模拟、Create、Options、PS、触摸板按下、触摸坐标。
+
+普通震动和自适应扳机也会回传：payload 在游戏进程中 hook
+`scePadSetVibration` 和 `scePadSetTriggerEffect`，把输出转换为 DualSense USB
+report `0x02`，再由 DS5Dongle 转成蓝牙 report `0x31` 发给真实手柄。
+游戏 hook 来自 GPL-3.0 的
+[PuckbridgePS5](https://github.com/ThisIsAkill/PuckbridgePS5) /
+[PoorDS4](https://github.com/ItsBlurf/PoorDS4)，许可与版本说明在
+`SOURCE MODIFIEE PAYLOAD/bridge/`。
+
+目前不转发高清音频触觉、灯条和耳机音频。IMU 原始数据也没有融合成姿态，
+`quat` 保持单位四元数。游戏必须实际调用上述两个 `scePad` API；只输出高清
+触觉音频而不调用普通震动 API 的游戏不会产生普通震动。
+
 ## Ce Qui Fonctionne En USB
 
 - Manba V2 en mode PC/XInput USB.
 - Manba V2 en mode Switch USB/dongle.
+- DS5Dongle Ghost mode (`CAFE:0D55`; legacy `054C:0CE6/0DF2` sans numero de serie) : rapport `0x01` mappe en `ScePadData`.
 - Correction de l'axe Y en mode Switch Manba dans `payload/gc_main.c`.
 - Quand la Manba devient active, la manette officielle se deconnectee proprement.
 - Si la manette officielle est rallumee sur un autre user, les deux manettes
@@ -184,6 +216,9 @@ Launch-GhostControl-ManbaV2-NBJr.bat
 ```
 Les zones importantes :
 
+- `payload/controller_ds5.h` / `controller_ds5.c`
+  - DS5Dongle Ghost `CAFE:0D55`, plus legacy `054C:0CE6/0DF2` sans numero de serie.
+  - Rapport `0x01` : sticks, gachettes, boutons, touchpad.
 - `payload/controller_mamba.h`
   - VID/PID Manba.
   - mode PC/XInput.
